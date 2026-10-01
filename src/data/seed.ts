@@ -50,6 +50,8 @@ export const seedState = (): ArchiveState => {
     audit: [{ id: 'seed', at: now, action: '初始化数据', detail: '导入两组示例口述史与手稿记录并完成首轮匹配', recordIds: [] }],
     activeMatchId: '',
     selectedRecordIds: [],
-    hydrated: false
+    hydrated: false,
+    sealJobs: [],
+    compensations: []
   };
 };
