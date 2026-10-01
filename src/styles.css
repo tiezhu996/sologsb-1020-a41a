@@ -153,3 +153,68 @@ kbd { justify-self: start; padding: 3px 6px; border: 1px solid #c8d2d5; border-b
 .qwik-check { display: grid; place-items: center; width: 17px; height: 17px; border: 1px solid #b9c8cc; border-radius: 4px; background: white; cursor: pointer; }
 .qwik-check[aria-checked="true"] { color: white; border-color: #3d7c89; background: #3d7c89; }
 @media (max-width: 1330px) { .desk-grid { grid-template-columns: minmax(330px, 1fr) minmax(380px, 1.15fr) minmax(300px, .85fr); gap: 10px; padding: 0 12px; } .overview, .bottom-grid { padding-left: 12px; padding-right: 12px; } .metrics { gap: 14px; } }
+
+/* ================= 封存归档区 ================= */
+.online-dot.offline { background: #d97757; box-shadow: 0 0 0 4px rgba(217,119,87,.16); }
+.archive-section { margin: 18px 18px 0; border: 1px solid rgba(27,64,77,.12); border-radius: 12px; background: rgba(251,252,251,.96); box-shadow: 0 14px 34px rgba(31,52,60,.07); }
+.archive-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 14px; padding: 17px 19px 13px; border-bottom: 1px solid #e4eaec; }
+.archive-head h2 { margin: 4px 0 2px; font-family: "Songti SC", serif; font-size: 21px; }
+.archive-head p { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.6; }
+.archive-controls { display: flex; align-items: center; gap: 7px; }
+.workstation-badge { padding: 6px 10px; border-radius: 7px; color: #23485a; background: #e6eef1; font-size: 10px; font-weight: 700; }
+.archive-grid { display: grid; grid-template-columns: minmax(430px, 1.15fr) minmax(360px, .85fr); gap: 0; }
+.archive-grid > .panel { border: 0; border-radius: 0; box-shadow: none; }
+.archive-grid > .panel:first-child { border-right: 1px solid #e4eaec; }
+.publish-panel { display: flex; flex-direction: column; }
+.job-list { max-height: 340px; overflow: auto; padding: 6px 12px; }
+.job-card { margin: 7px 0; padding: 10px 12px; border: 1px solid #dde6e8; border-left: 3px solid #9fb5bb; border-radius: 8px; background: #f7f9f9; }
+.job-card.sealed { border-left-color: #2f7f61; background: #f1f7f4; }
+.job-card.reserved, .job-card.object-reused { border-left-color: #b98a48; background: #fbf6ec; }
+.job-card.failed, .job-card.conflict { border-left-color: var(--red); background: #fcf3f1; }
+.job-card.queued { border-left-color: #6f8994; }
+.job-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.job-head strong { font-size: 11px; }
+.job-stage { flex: 0 0 auto; padding: 2px 7px; border-radius: 8px; background: #e7eaeb; color: #5a6c74; font-size: 8px; font-weight: 700; }
+.job-stage.sealed { color: #276246; background: #dcf0e5; }
+.job-stage.reserved, .job-stage.object-reused { color: #8b5d18; background: #faedcf; }
+.job-stage.failed, .job-stage.conflict { color: #81534d; background: #f1e3e0; }
+.job-hint { margin: 5px 0 0; color: var(--muted); font-size: 9px; line-height: 1.5; }
+.job-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 7px; color: #75848c; font-size: 8px; }
+.job-meta code { color: #3f6671; }
+.job-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
+.fail-toggle { display: inline-flex; align-items: center; gap: 4px; color: #87604f; font-size: 8px; }
+.compensation-block { border-top: 1px solid #e4eaec; padding: 10px 12px 13px; }
+.comp-head { display: flex; align-items: baseline; gap: 9px; margin-bottom: 6px; }
+.comp-head strong { font-size: 11px; }
+.comp-head > span:last-child { margin-left: auto; color: var(--muted); font-size: 8px; }
+.comp-card { margin: 7px 0; padding: 9px 11px; border: 1px dashed #d2c6b2; border-radius: 8px; background: #fdfaf2; }
+.comp-card.sealed { border-style: solid; border-color: #bcdcc9; background: #f2f8f4; }
+.comp-card.discarded { opacity: .62; }
+.comp-detail { margin: 6px 0 0; padding-left: 15px; color: #5d6f77; font-size: 9px; line-height: 1.8; }
+.comp-detail code { margin-right: 5px; padding: 1px 5px; border-radius: 4px; background: #e8eef0; color: #3f6671; }
+.service-panel { min-height: 420px; }
+.service-scroll { height: 468px; overflow: auto; padding: 8px 12px; }
+.service-card { margin: 7px 0; padding: 9px 11px; border: 1px solid #e0e7e9; border-radius: 8px; background: #f6f9f9; }
+.kind-tag { padding: 2px 7px; border-radius: 8px; background: #e2edf1; color: #315f77; font-size: 8px; font-weight: 700; }
+.version-chain { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+.version-pill { padding: 3px 8px; border-radius: 20px; background: #e4efe7; color: #2f6c52; font-size: 8px; }
+.transfer-note { margin: 4px 0 0; padding: 4px 7px; border-radius: 5px; background: #f6ecdb; color: #7c5b2e; font-size: 8px; }
+.ledger-row { display: grid; grid-template-columns: 58px 64px 1fr; gap: 6px; align-items: start; padding: 7px 2px; border-bottom: 1px solid #edf1f2; font-size: 8px; }
+.ledger-row time { color: #8a969c; }
+.ledger-row p { margin: 0; color: #4f626a; line-height: 1.5; }
+.ledger-type { padding: 2px 5px; border-radius: 5px; text-align: center; font-weight: 700; }
+.evt-对象登记, .evt-批次封存 { color: #276246; background: #dcf0e5; }
+.evt-对象复用, .evt-重复提交拦截, .evt-发布对账 { color: #315f77; background: #dcebf2; }
+.evt-批次预留 { color: #8b5d18; background: #faedcf; }
+.evt-发布失败, .evt-预留冲突 { color: #81534d; background: #f1e3e0; }
+.evt-过期接管 { color: #6a4d88; background: #ece1f4; }
+.withdrawn-tag { margin-left: 8px; padding: 1px 7px; border-radius: 8px; background: #f1e3e0; color: #81534d; font-size: 8px; }
+.withdrawn-note { color: #81534d; font-size: 9px; }
+.merge-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
+.job-chip { padding: 2px 7px; border-radius: 8px; background: #e7eaeb; color: #5a6c74; font-size: 8px; }
+.job-chip.sealed { color: #276246; background: #dcf0e5; }
+.job-chip.failed, .job-chip.conflict { color: #81534d; background: #f1e3e0; }
+.modal-backdrop { position: fixed; inset: 0; z-index: 90; display: grid; place-items: center; background: rgba(18,38,50,.45); }
+.inline-modal { position: relative; width: min(620px, calc(100vw - 32px)); max-height: 86vh; overflow: auto; border-radius: 14px; background: var(--paper); box-shadow: 0 24px 60px rgba(12,30,40,.3); }
+.modal-title { margin: 4px 0 0; font-family: "Songti SC", serif; font-size: 19px; }
+.inline-modal .modal-textarea { width: calc(100% - 40px); min-height: 90px; margin-top: 0; }

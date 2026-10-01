@@ -2,9 +2,21 @@ import {
   $, component$, useComputed$, useSignal, useStore, useVisibleTask$
 } from '@builder.io/qwik';
 import { Checkbox, Modal, Tabs } from '@qwik-ui/headless';
-import type { ArchiveRecord, ArchiveState, FieldKey, MatchCandidate, RecordGroup } from './types';
+import type { ArchiveRecord, ArchiveState, FieldKey, MatchCandidate, RecordGroup, PublishJob } from './types';
 import { computeMatches, fieldValue, scorePair } from './utils/matching';
 import { seedState } from './data/seed';
+import { SealingService } from './services/sealingService';
+import {
+  audit,
+  confirmCompensation,
+  createMergeJob,
+  discardCompensation,
+  findMergeJob,
+  reconcileJob,
+  runPublish,
+  takeoverReservation,
+  withdrawMerge
+} from './services/publish';
 
 const STORAGE_KEY = 'sologsb-1020-archive-state-v1';
 const fieldLabels: Array<[FieldKey, string]> = [
@@ -25,6 +37,15 @@ const matchLabel = (state: ArchiveState, match: MatchCandidate) => {
   return `${left?.title ?? '未知记录'} ↔ ${right?.title ?? '未知记录'}`;
 };
 
+const stageMeta: Record<PublishJob['stage'], { label: string; hint: string }> = {
+  queued: { label: '本机待发', hint: '结论保存在本机工作区，尚未联系封存服务' },
+  'object-reused': { label: '对象已定位', hint: '已按对象摘要复用或登记对象，等待预留批次' },
+  reserved: { label: '批次已预留', hint: '批次归属本机，恢复后可直接封存' },
+  sealed: { label: '已封存', hint: '封存服务已写入新版本' },
+  failed: { label: '发布失败', hint: '同一批次已保留，重试不会重复建档' },
+  conflict: { label: '预留冲突', hint: '批次被他人预留，可对账或等过期后接管' }
+};
+
 export default component$(() => {
   const state = useStore<ArchiveState>(seedState());
   const history = useSignal<string[]>([]);
@@ -41,6 +62,21 @@ export default component$(() => {
   const importText = useSignal('');
   const toast = useSignal('');
   const panelTab = useSignal(0);
+  const sealingOnline = useSignal(true);
+  const serviceTick = useSignal(0);
+  const archiveTab = useSignal(0);
+  const withdrawOpen = useSignal(false);
+  const withdrawMergeId = useSignal('');
+  const withdrawReason = useSignal('');
+  const compensateTaskId = useSignal('');
+  const compensateReason = useSignal('');
+
+  const getService = () => new SealingService();
+  const refreshService = $(() => {
+    const service = getService();
+    sealingOnline.value = service.online;
+    serviceTick.value += 1;
+  });
 
   const snapshot = () => JSON.stringify({
     revision: state.revision,
@@ -51,7 +87,14 @@ export default component$(() => {
   });
 
   const capture = () => {
-    history.value = [...history.value.slice(-49), snapshot()];
+    // 撤销栈只覆盖核对结论与字段选择；发布任务/补偿任务以封存服务为准，不随撤销回滚
+    history.value = [...history.value.slice(-49), JSON.stringify({
+      revision: state.revision,
+      records: state.records,
+      matches: state.matches,
+      merges: state.merges,
+      audit: state.audit
+    })];
     future.value = [];
   };
 
@@ -62,6 +105,9 @@ export default component$(() => {
     state.matches = next.matches ?? state.matches;
     state.merges = next.merges ?? state.merges;
     state.audit = next.audit ?? state.audit;
+    if (next.jobs) state.jobs = next.jobs;
+    if (next.compensations) state.compensations = next.compensations;
+    if (next.workstationId) state.workstationId = next.workstationId;
   };
 
   const notify = (message: string) => {
@@ -189,11 +235,142 @@ export default component$(() => {
       rightId: right.id,
       chosen: { ...choices },
       values,
-      mergedAt: new Date().toISOString()
+      mergedAt: new Date().toISOString(),
+      sourceRecords: [structuredClone(left), structuredClone(right)]
     });
     commit('合并两条记录', `保留 ${Object.values(choices).filter((choice) => choice === 'A').length} 个 A 来源字段、${Object.values(choices).filter((choice) => choice === 'B').length} 个 B 来源字段`, [left.id, right.id, merged.id]);
     mergeOpen.value = false;
     notify('记录已合并，来源与字段选择已写入审计记录');
+  });
+
+  /* ===================== 封存归档动作 ===================== */
+
+  const serviceObjects = useComputed$(() => {
+    serviceTick.value;
+    return getService().state.objects;
+  });
+  const serviceBatches = useComputed$(() => {
+    serviceTick.value;
+    return getService().state.batches;
+  });
+  const serviceLedger = useComputed$(() => {
+    serviceTick.value;
+    return getService().state.ledger;
+  });
+  const pendingCompensations = useComputed$(() => state.compensations.filter((task) => task.status === 'pending'));
+
+  const publishMerge = $((mergeId: string) => {
+    try {
+      const job = createMergeJob(state, mergeId, state.workstationId);
+      const outcome = runPublish(state, getService(), job.id).outcome;
+      refreshService();
+      notify(outcome === 'sealed' ? '已按对象摘要复用对象并封存'
+        : outcome === 'queued' ? '断网：结论暂存本机，联网后可重试'
+        : outcome === 'conflict' ? '批次已被他人预留，请发布对账'
+        : '发布未完成，可恢复同一批次重试');
+    } catch (error) {
+      notify(error instanceof Error ? error.message : '发布失败');
+    }
+  });
+
+  const retryJob = $((jobId: string) => {
+    const outcome = runPublish(state, getService(), jobId).outcome;
+    refreshService();
+    notify(outcome === 'sealed' ? '已恢复同一批次并封存，未重复建档'
+      : outcome === 'queued' ? '仍不可达，结论继续保留在本机'
+      : outcome === 'conflict' ? '批次仍被他人预留'
+      : '批次已恢复，请继续重试');
+  });
+
+  const toggleSealingOnline = $(() => {
+    const service = getService();
+    service.setOnline(!service.online);
+    sealingOnline.value = service.online;
+    notify(service.online ? '封存服务已恢复连通' : '已模拟断网：发布将停在本机或失败步骤');
+  });
+
+  /** 模拟另一工位抢先预留同一对象（两人同时发布） */
+  const simulateRival = $((jobId: string) => {
+    const job = state.jobs.find((item) => item.id === jobId);
+    if (!job) return;
+    const service = getService();
+    if (!service.online) { notify('封存服务离线，无法模拟并发预留'); return; }
+    const resolved = service.resolveObject(job.digest, job.payload.kind, job.conclusionKey, '工位-乙');
+    service.reserveBatch(resolved.object, job.digest, '工位-乙', crypto.randomUUID());
+    refreshService();
+    notify('工位-乙 已抢先预留同一对象的批次，再试发布即触发冲突');
+  });
+
+  const doReconcile = $((jobId: string) => {
+    try {
+      reconcileJob(state, getService(), jobId);
+      refreshService();
+      notify('发布对账完成，本机状态已与封存服务对齐');
+    } catch (error) {
+      notify(error instanceof Error ? error.message : '对账失败');
+    }
+  });
+
+  const doTakeover = $((jobId: string) => {
+    const result = takeoverReservation(state, getService(), jobId);
+    refreshService();
+    if (result.outcome === 'reserved') {
+      runPublish(state, getService(), jobId);
+      refreshService();
+      notify('已接管过期预留并完成封存，交接记录留在封存服务');
+    } else {
+      notify('原预留尚未过期，暂不能接管');
+    }
+  });
+
+  const openWithdraw = $((mergeId: string) => {
+    withdrawMergeId.value = mergeId;
+    withdrawReason.value = '';
+    withdrawOpen.value = true;
+  });
+
+  const confirmWithdraw = $(() => {
+    try {
+      withdrawMerge(state, withdrawMergeId.value, withdrawReason.value || '核对后撤回');
+      withdrawOpen.value = false;
+      notify(pendingCompensations.value.length ? '已生成补偿任务：列出受影响记录、引用对象与封存版本' : '已在本机撤回（该合并尚未封存，无需补偿）');
+    } catch (error) {
+      notify(error instanceof Error ? error.message : '撤回失败');
+    }
+  });
+
+  const openCompensate = $((taskId: string) => {
+    compensateTaskId.value = taskId;
+    compensateReason.value = '';
+  });
+
+  const confirmCompensateNow = $(() => {
+    try {
+      confirmCompensation(state, getService(), compensateTaskId.value, compensateReason.value || '撤回合并后重新核对');
+      compensateTaskId.value = '';
+      refreshService();
+      notify('补偿已发布：同一对象生成新版本，旧版本保留');
+    } catch (error) {
+      notify(error instanceof Error ? error.message : '补偿失败');
+    }
+  });
+
+  const discardCompensate = $((taskId: string) => {
+    discardCompensation(state, taskId);
+    notify('补偿任务已放弃，封存版本维持不变');
+  });
+
+  const toggleFailSeal = $((jobId: string) => {
+    const job = state.jobs.find((item) => item.id === jobId);
+    if (!job) return;
+    job.failSealOnce = !job.failSealOnce;
+    notify(job.failSealOnce ? '下一次封存在服务端写入失败（批次仍保留）' : '已取消封存失败模拟');
+  });
+
+  const resetSealing = $(() => {
+    getService().reset();
+    refreshService();
+    notify('封存服务已重置（本机工作区结论保留，可重新发布）');
   });
 
   const parseImport = $(() => {
@@ -279,6 +456,12 @@ export default component$(() => {
   });
 
   useVisibleTask$(() => {
+    sealingOnline.value = getService().online;
+    const timer = window.setInterval(() => refreshService(), 4000);
+    return () => window.clearInterval(timer);
+  });
+
+  useVisibleTask$(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
@@ -292,7 +475,16 @@ export default component$(() => {
   });
 
   useVisibleTask$(({ track }) => {
-    const payload = track(() => JSON.stringify({ revision: state.revision, records: state.records, matches: state.matches, merges: state.merges, audit: state.audit }));
+    const payload = track(() => JSON.stringify({
+      revision: state.revision,
+      records: state.records,
+      matches: state.matches,
+      merges: state.merges,
+      audit: state.audit,
+      jobs: state.jobs,
+      compensations: state.compensations,
+      workstationId: state.workstationId
+    }));
     if (state.hydrated) localStorage.setItem(STORAGE_KEY, payload);
   });
 
@@ -327,7 +519,7 @@ export default component$(() => {
           <div class="brand-seal">档</div>
           <div><h1>档案元数据核对台</h1><p>ARCHIVE RECONCILIATION DESK</p></div>
         </div>
-        <div class="top-stat"><span class="online-dot" />{state.hydrated ? `离线保存 · r${state.revision}` : '正在恢复本地工作区'}</div>
+        <div class="top-stat"><span class={`online-dot ${sealingOnline.value ? '' : 'offline'}`} />{state.hydrated ? `${sealingOnline.value ? '封存服务在线' : '封存服务离线'} · 本机 r${state.revision}` : '正在恢复本地工作区'}</div>
         <div class="top-actions">
           <button class="icon-button" disabled={!history.value.length} onClick$={undo}>撤销</button>
           <button class="icon-button" disabled={!future.value.length} onClick$={redo}>重做</button>
@@ -446,7 +638,12 @@ export default component$(() => {
               {state.merges.length ? state.merges.map((merge) => {
                 const left = recordById(state, merge.leftId);
                 const right = recordById(state, merge.rightId);
-                return <details class="merge-log" key={merge.id}><summary>{left?.title ?? merge.leftId} ↔ {right?.title ?? merge.rightId}</summary><p>{new Date(merge.mergedAt).toLocaleString('zh-CN')}</p><ul>{Object.entries(merge.chosen).map(([field, choice]) => <li key={field}><strong>{fieldLabels.find(([key]) => key === field)?.[1]}</strong><span>保留 {choice === 'A' ? 'A 来源' : choice === 'B' ? 'B 来源' : '双来源拼接'}：{merge.values[field as FieldKey]}</span></li>)}</ul></details>;
+                const job = findMergeJob(state, merge.id);
+                return <details class="merge-log" key={merge.id} open={!!merge.withdrawnAt}><summary>{left?.title ?? merge.leftId} ↔ {right?.title ?? merge.rightId}{merge.withdrawnAt && <span class="withdrawn-tag">已撤回</span>}</summary><p>{new Date(merge.mergedAt).toLocaleString('zh-CN')}</p><ul>{Object.entries(merge.chosen).map(([field, choice]) => <li key={field}><strong>{fieldLabels.find(([key]) => key === field)?.[1]}</strong><span>保留 {choice === 'A' ? 'A 来源' : choice === 'B' ? 'B 来源' : '双来源拼接'}：{merge.values[field as FieldKey]}</span></li>)}</ul>
+                  {merge.withdrawnAt
+                    ? <p class="withdrawn-note">已于 {new Date(merge.withdrawnAt).toLocaleString('zh-CN')} 撤回，原两条记录已恢复，字段选择与撤销记录保留。</p>
+                    : <div class="merge-actions"><button class="button primary small" onClick$={() => publishMerge(merge.id)}>{job ? '重新发布此结论' : '发布到封存服务'}</button><button class="button ghost small" onClick$={() => openWithdraw(merge.id)}>撤回合并</button>{job && <span class={`job-chip ${job.stage}`}>{stageMeta[job.stage].label}{job.version ? ` · v${job.version}` : ''}</span>}</div>}
+                </details>;
               }) : <div class="empty-state">还没有合并记录。完成一次字段合并后，来源选择会出现在这里。</div>}
             </Tabs.Panel>
             <Tabs.Panel class="tab-panel shortcut-panel">
@@ -470,6 +667,99 @@ export default component$(() => {
           <div class="rule-row"><span>2</span><p>原始记录、合并结果和忽略理由都进入本地审计轨迹。</p></div>
           <div class="rule-row"><span>3</span><p>记录列表使用分批窗口渲染，导入大量数据时仍只挂载当前窗口。</p></div>
         </article>
+      </section>
+
+      <section class="archive-section">
+        <div class="archive-head">
+          <div><span class="eyebrow">04 / SEALING ARCHIVE</span><h2>封存归档</h2><p>本机工作区管核对结论、字段选择和撤销记录；封存服务管对象摘要、发布批次和封存状态。</p></div>
+          <div class="archive-controls">
+            <span class="workstation-badge">{state.workstationId}</span>
+            <button class={`button small ${sealingOnline.value ? 'confirm' : 'danger'}`} onClick$={toggleSealingOnline}>{sealingOnline.value ? '● 服务在线（点击模拟断网）' : '○ 服务离线（点击恢复）'}</button>
+            <button class="button small ghost" onClick$={resetSealing}>重置封存服务</button>
+          </div>
+        </div>
+        <div class="archive-grid">
+          <article class="panel publish-panel">
+            <div class="panel-heading"><div><span class="eyebrow">PUBLISH JOBS</span><h3>发布队列（本机工作区）</h3></div><span>{state.jobs.length} 个任务</span></div>
+            <div class="job-list">
+              {state.jobs.map((job) => (
+                <div class={`job-card ${job.stage}`} key={job.id}>
+                  <div class="job-head">
+                    <strong>{job.title}</strong>
+                    <span class={`job-stage ${job.stage}`}>{stageMeta[job.stage].label}{job.version ? ` · v${job.version}` : ''}</span>
+                  </div>
+                  <p class="job-hint">{job.lastError ?? stageMeta[job.stage].hint}</p>
+                  <div class="job-meta">
+                    <span>对象 <code>{job.objectId ?? '—'}</code></span>
+                    <span>批次 <code>{job.batchId ?? '—'}</code></span>
+                    <span>摘要 <code>{job.digest.slice(6, 16)}</code></span>
+                    <span>尝试 {job.attempts} 次</span>
+                    {job.reservedUntil && <span>预留至 {new Date(job.reservedUntil).toLocaleTimeString('zh-CN', { hour12: false })}</span>}
+                  </div>
+                  <div class="job-actions">
+                    {job.stage !== 'sealed' && <button class="button primary small" onClick$={() => retryJob(job.id)}>恢复同一批次重试</button>}
+                    {job.stage === 'conflict' && <button class="button small confirm" onClick$={() => doTakeover(job.id)}>接管过期预留</button>}
+                    {(job.stage === 'conflict' || job.stage === 'reserved' || job.stage === 'sealed') && <button class="button small ghost" onClick$={() => doReconcile(job.id)}>发布对账</button>}
+                    {job.stage !== 'sealed' && <button class="button small ghost" onClick$={() => simulateRival(job.id)} title="模拟两人同时发布">模拟工位-乙抢预留</button>}
+                    {job.stage !== 'sealed' && <label class="fail-toggle"><input type="checkbox" checked={job.failSealOnce} onChange$={() => toggleFailSeal(job.id)} />下次封存失败</label>}
+                  </div>
+                </div>
+              ))}
+              {!state.jobs.length && <div class="empty-state">还没有发布任务。在「合并追溯」里把已合并的结论发布到封存服务。</div>}
+            </div>
+
+            <div class="compensation-block">
+              <div class="comp-head"><span class="eyebrow">COMPENSATION</span><strong>撤回合并补偿任务</strong><span>{pendingCompensations.value.length} 待确认</span></div>
+              {state.compensations.map((task) => (
+                <div class={`comp-card ${task.status}`} key={task.id}>
+                  <div class="job-head"><strong>合并 {task.mergeId.slice(-8)} 的补偿</strong><span class={`job-stage ${task.status === 'sealed' ? 'sealed' : task.status === 'pending' ? 'reserved' : 'rejected'}`}>{task.status === 'pending' ? '待确认' : task.status === 'submitted' ? '已提交' : task.status === 'sealed' ? `已封存 v${task.newVersion}` : '已放弃'}</span></div>
+                  <ul class="comp-detail">
+                    <li>受影响记录：{task.affectedRecordIds.map((id) => <code key={id}>{id.slice(0, 10)}</code>)}</li>
+                    <li>引用对象：{task.referencedObjectIds.length ? task.referencedObjectIds.map((id) => <code key={id}>{id}</code>) : '无'}</li>
+                    <li>现封存版本：{task.sealedVersion ? <code>v{task.sealedVersion}</code> : '未封存'}{task.newVersion ? <> → 新版本 <code>v{task.newVersion}</code>（旧版本保留）</> : null}</li>
+                  </ul>
+                  {task.status === 'pending' && <div class="job-actions"><button class="button primary small" onClick$={() => openCompensate(task.id)}>确认并生成新版本</button><button class="button ghost small" onClick$={() => discardCompensate(task.id)}>放弃补偿</button></div>}
+                  {task.jobId && <p class="job-hint">补偿发布任务：{task.jobId}</p>}
+                </div>
+              ))}
+              {!state.compensations.length && <p class="job-hint">撤回一个已封存的合并后，会在此列出受影响记录、引用对象和封存版本。</p>}
+            </div>
+          </article>
+
+          <article class="panel service-panel">
+            <Tabs.Root bind:selectedIndex={archiveTab} class="review-tabs">
+              <Tabs.List class="tab-list"><Tabs.Tab>对象与版本</Tabs.Tab><Tabs.Tab>发布批次</Tabs.Tab><Tabs.Tab>服务流水</Tabs.Tab></Tabs.List>
+              <Tabs.Panel class="tab-panel service-scroll">
+                {serviceObjects.value.length ? serviceObjects.value.map((object) => (
+                  <div class="service-card" key={object.id}>
+                    <div class="job-head"><strong>{object.id}</strong><span class="kind-tag">{object.kind === 'merge' ? '合并发布' : object.kind === 'merge-withdraw' ? '撤回补偿' : '确认'}</span></div>
+                    <p class="job-hint">结论 {object.conclusionKey.slice(-8)} · 摘要 {object.digest.slice(6, 16)}</p>
+                    <div class="version-chain">{object.versions.map((version) => <span class="version-pill" key={version.version}>v{version.version} · {version.workstationId} · {new Date(version.at).toLocaleDateString('zh-CN')}</span>)}</div>
+                  </div>
+                )) : <div class="empty-state">封存服务中还没有对象。发布时按对象摘要复用，同一结论只建一次档。</div>}
+              </Tabs.Panel>
+              <Tabs.Panel class="tab-panel service-scroll">
+                {serviceBatches.value.length ? serviceBatches.value.map((batch) => (
+                  <div class="service-card" key={batch.id}>
+                    <div class="job-head"><strong>{batch.id}</strong><span class={`job-stage ${batch.status === 'sealed' ? 'sealed' : batch.status === 'reserved' ? 'reserved' : 'rejected'}`}>{batch.status === 'sealed' ? `已封存 v${batch.version}` : batch.status === 'reserved' ? '预留中' : '已释放'}</span></div>
+                    <p class="job-hint">对象 {batch.objectId} · 归属 {batch.workstationId}</p>
+                    <p class="job-hint">预留 {new Date(batch.reservedAt).toLocaleTimeString('zh-CN', { hour12: false })} → {new Date(batch.reservedUntil).toLocaleTimeString('zh-CN', { hour12: false })}{batch.sealedAt ? ` · 封存 ${new Date(batch.sealedAt).toLocaleTimeString('zh-CN', { hour12: false })}` : ''}</p>
+                    {batch.transfers.map((transfer, index) => <p class="transfer-note" key={index}>接管记录：{transfer.from} → {transfer.to}（{new Date(transfer.at).toLocaleTimeString('zh-CN', { hour12: false })}）{transfer.reason}</p>)}
+                  </div>
+                )) : <div class="empty-state">还没有发布批次。先预留批次再封存，失败后可恢复同一批次。</div>}
+              </Tabs.Panel>
+              <Tabs.Panel class="tab-panel service-scroll">
+                {serviceLedger.value.length ? serviceLedger.value.slice(0, 40).map((event) => (
+                  <div class="ledger-row" key={event.id}>
+                    <time>{new Date(event.at).toLocaleTimeString('zh-CN', { hour12: false })}</time>
+                    <span class={`ledger-type evt-${event.type}`}>{event.type}</span>
+                    <p>{event.detail}</p>
+                  </div>
+                )) : <div class="empty-state">封存服务流水为空。</div>}
+              </Tabs.Panel>
+            </Tabs.Root>
+          </article>
+        </div>
       </section>
 
       {toast.value && <div class="toast">{toast.value}</div>}
@@ -511,6 +801,36 @@ export default component$(() => {
           })()}
         </Modal.Panel>
       </Modal.Root>
+
+      <Modal.Root bind:show={withdrawOpen} closeOnBackdropClick>
+        <Modal.Panel class="modal-panel">
+          <Modal.Header class="modal-header"><div><span class="eyebrow">WITHDRAW MERGE</span><Modal.Title>撤回合并并生成补偿任务</Modal.Title></div><Modal.Close class="modal-close">×</Modal.Close></Modal.Header>
+          <Modal.Description class="modal-description">本机工作区将恢复合并前的两条记录并保留字段选择与撤销记录。若该合并已在封存服务封存，会生成补偿任务：列出受影响记录、引用对象与当前封存版本，确认后在同一对象上生成新版本，旧版本保留。</Modal.Description>
+          <textarea class="modal-textarea" value={withdrawReason.value} onInput$={(event) => withdrawReason.value = (event.target as HTMLTextAreaElement).value} placeholder="撤回原因（例如：研究者确认两份材料不应合并）" />
+          <Modal.Footer class="modal-footer"><Modal.Close class="button ghost">取消</Modal.Close><button class="button danger" onClick$={confirmWithdraw}>撤回合并</button></Modal.Footer>
+        </Modal.Panel>
+      </Modal.Root>
+
+      {compensateTaskId.value && (
+        <div class="modal-backdrop" onClick$={() => compensateTaskId.value = ''}>
+          <div class="modal-panel inline-modal" onClick$={(event) => event.stopPropagation()}>
+            <div class="modal-header"><div><span class="eyebrow">CONFIRM COMPENSATION</span><h3 class="modal-title">确认补偿 · 生成新版本</h3></div><button class="modal-close" onClick$={() => compensateTaskId.value = ''}>×</button></div>
+            {(() => {
+              const task = state.compensations.find((item) => item.id === compensateTaskId.value);
+              if (!task) return null;
+              return <>
+                <p class="modal-description">对象 <code>{task.objectId}</code> 当前为 <code>v{task.sealedVersion}</code>。确认后将提交「撤回合并」补偿，在对象上追加新版本并完整保留 v1–v{task.sealedVersion}。</p>
+                <ul class="comp-detail">
+                  <li>受影响记录（{task.affectedRecordIds.length}）：{task.affectedRecordIds.map((id) => <code key={id}>{id.slice(0, 10)}</code>)}</li>
+                  <li>引用对象（{task.referencedObjectIds.length}）：{task.referencedObjectIds.map((id) => <code key={id}>{id}</code>)}</li>
+                </ul>
+                <textarea class="modal-textarea" value={compensateReason.value} onInput$={(event) => compensateReason.value = (event.target as HTMLTextAreaElement).value} placeholder="补偿说明（例如：重新核对后确认两份记录分属不同采访）" />
+                <div class="modal-footer"><button class="button ghost" onClick$={() => compensateTaskId.value = ''}>取消</button><button class="button primary" onClick$={confirmCompensateNow}>确认并封存新版本</button></div>
+              </>;
+            })()}
+          </div>
+        </div>
+      )}
     </div>
   );
 });
